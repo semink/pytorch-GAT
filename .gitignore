@@ -14,3 +14,7 @@ data/
 
 # Tensorboard dump dir
 runs/
+
+env/
+
+.vscode/

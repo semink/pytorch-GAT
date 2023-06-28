@@ -79,7 +79,7 @@ def load_graph_data(training_config, device):
             topology = build_edge_index(adjacency_list_dict, num_of_nodes, add_self_edges=True)
         elif layer_type == LayerType.IMP2 or layer_type == LayerType.IMP1:
             # adjacency matrix shape = (N, N)
-            topology = nx.adjacency_matrix(nx.from_dict_of_lists(adjacency_list_dict)).todense().astype(np.float)
+            topology = nx.adjacency_matrix(nx.from_dict_of_lists(adjacency_list_dict)).todense().astype(np.float64)
             topology += np.identity(topology.shape[0])  # add self connections
             topology[topology > 0] = 1  # multiple edges not allowed
             topology[topology == 0] = -np.inf  # make it a mask instead of adjacency matrix (used to mask softmax)
