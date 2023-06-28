@@ -1,5 +1,6 @@
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 
 from utils.constants import LayerType
@@ -62,14 +63,17 @@ class GAT(torch.nn.Module):
             )
             gat_layers.append(layer)
 
-        self.gat_net = nn.Sequential(
-            *gat_layers,
+        self.gat_net = nn.ModuleList(
+            gat_layers,
         )
 
     # data is just a (in_nodes_features, topology) tuple, I had to do it like this because of the nn.Sequential:
     # https://discuss.pytorch.org/t/forward-takes-2-positional-arguments-but-3-were-given-for-nn-sqeuential-with-linear-layers/65698
     def forward(self, data):
-        return self.gat_net(data)
+        x = data[0]
+        for gat_layer, graph_data in zip(self.gat_net, data[1]):
+            x = gat_layer((x, graph_data))
+        return x
 
 
 class GATLayer(torch.nn.Module):
@@ -288,15 +292,16 @@ class GATLayerImp3(GATLayer):
             log_attention_weights,
         )
 
-        self.layer_combiner = nn.Linear(num_of_accesspoint, 1)
-        nn.init.xavier_uniform_(self.layer_combiner.weight)
-
     def forward(self, data):
+        
+        # data = (in_nodes_features, edge_index_bank)
+        # edge_index_bank = dict(pooling=torch.Tensor, aggregation=torch.Tensor)
         #
         # Step 1: Linear Projection + regularization
         #
 
         in_nodes_features, edge_index_bank = data  # unpack data
+        pooling, aggregation = edge_index_bank["pooling"], edge_index_bank["aggregation"]
         num_of_nodes = in_nodes_features.shape[self.nodes_dim]
         # assert (
         #     edge_index.shape[0] == 2
@@ -327,89 +332,84 @@ class GATLayerImp3(GATLayer):
         scores_source = (nodes_features_proj * self.scoring_fn_source).sum(dim=-1)
         scores_target = (nodes_features_proj * self.scoring_fn_target).sum(dim=-1)
 
-        # ------------------------------------------ for loop starts
-        output_feature_concat = []
-        for edge_info in edge_index_bank:
-            # 3.1. aggregation
-            (_, _, nodes_features_proj_lifted, edge_weights_lifted) = self.lift(
-                scores_source,
-                scores_target,
-                nodes_features_proj,
-                edge_info["aggregation"]["edge_index"],
-                edge_info["aggregation"]["edge_weight"],
-            )
+        
+        # 3.1. aggregation
+        (_, _, nodes_features_proj_lifted, edge_weights_lifted) = self.lift(
+            scores_source,
+            scores_target,
+            nodes_features_proj,
+            aggregation["edge_index"],
+            aggregation["edge_weight"],
+        )
 
-            nodes_features_proj_lifted_weighted = (
-                nodes_features_proj_lifted
-                * edge_weights_lifted.unsqueeze(-1).unsqueeze(-1)
-            )
+        nodes_features_proj_lifted_weighted = (
+            nodes_features_proj_lifted
+            * edge_weights_lifted.unsqueeze(-1).unsqueeze(-1)
+        )
 
-            # This part sums up weighted and projected neighborhood feature vectors for every target node
-            # shape = (N, NH, FOUT)
-            agg_nodes_features = self.aggregate_neighbors(
-                nodes_features_proj_lifted_weighted,
-                edge_info["aggregation"]["edge_index"],
-                num_of_nodes,
-            )
+        # This part sums up weighted and projected neighborhood feature vectors for every target node
+        # shape = (N, NH, FOUT)
+        agg_nodes_features = self.aggregate_neighbors(
+            nodes_features_proj_lifted_weighted,
+            aggregation["edge_index"],
+            num_of_nodes,
+        )
 
-            # We simply copy (lift) the scores for source/target nodes based on the edge index. Instead of preparing all
-            # the possible combinations of scores we just prepare those that will actually be used and those are defined
-            # by the edge index.
-            # scores shape = (E, NH), nodes_features_proj_lifted shape = (E, NH, FOUT), E - number of edges in the graph
-            (
-                scores_source_lifted,
-                scores_target_lifted,
-                agg_nodes_features_proj_lifted,
-                _,
-            ) = self.lift(
-                scores_source,
-                scores_target,
-                agg_nodes_features,
-                edge_info["pooling"]["edge_index"],
-            )
-            scores_per_edge = self.leakyReLU(
-                scores_source_lifted + scores_target_lifted
-            )
+        # We simply copy (lift) the scores for source/target nodes based on the edge index. Instead of preparing all
+        # the possible combinations of scores we just prepare those that will actually be used and those are defined
+        # by the edge index.
+        # scores shape = (E, NH), nodes_features_proj_lifted shape = (E, NH, FOUT), E - number of edges in the graph
+        (
+            scores_source_lifted,
+            scores_target_lifted,
+            agg_nodes_features_proj_lifted,
+            _,
+        ) = self.lift(
+            scores_source,
+            scores_target,
+            agg_nodes_features,
+            pooling["edge_index"],
+        )
+        scores_per_edge = self.leakyReLU(
+            scores_source_lifted + scores_target_lifted
+        )
 
-            # shape = (E, NH, 1)
-            attentions_per_edge = self.neighborhood_aware_softmax(
-                scores_per_edge,
-                edge_info["pooling"]["edge_index"][self.trg_nodes_dim],
-                num_of_nodes,
-            )
-            # Add stochasticity to neighborhood aggregation
-            attentions_per_edge = self.dropout(attentions_per_edge)
+        # shape = (E, NH, 1)
+        attentions_per_edge = self.neighborhood_aware_softmax(
+            scores_per_edge,
+            pooling["edge_index"][self.trg_nodes_dim],
+            num_of_nodes,
+        )
+        # Add stochasticity to neighborhood aggregation
+        attentions_per_edge = self.dropout(attentions_per_edge)
 
-            #
-            # Step 3: Neighborhood aggregation
-            #
+        #
+        # Step 3: Neighborhood aggregation
+        #
 
-            # Element-wise (aka Hadamard) product. Operator * does the same thing as torch.mul
-            # shape = (E, NH, FOUT) * (E, NH, 1) -> (E, NH, FOUT), 1 gets broadcast into FOUT
-            agg_nodes_features_proj_lifted_weighted = (
-                agg_nodes_features_proj_lifted * attentions_per_edge
-            )
+        # Element-wise (aka Hadamard) product. Operator * does the same thing as torch.mul
+        # shape = (E, NH, FOUT) * (E, NH, 1) -> (E, NH, FOUT), 1 gets broadcast into FOUT
+        agg_nodes_features_proj_lifted_weighted = (
+            agg_nodes_features_proj_lifted * attentions_per_edge
+        )
 
-            # This part sums up weighted and projected neighborhood feature vectors for every target node
-            # shape = (N, NH, FOUT)
-            out_nodes_features = self.aggregate_neighbors(
-                agg_nodes_features_proj_lifted_weighted,
-                edge_info["pooling"]["edge_index"],
-                num_of_nodes,
-            )
+        # This part sums up weighted and projected neighborhood feature vectors for every target node
+        # shape = (N, NH, FOUT)
+        out_nodes_features = self.aggregate_neighbors(
+            agg_nodes_features_proj_lifted_weighted,
+            pooling["edge_index"],
+            num_of_nodes,
+        )
 
-            #
-            # Step 4: Residual/skip connections, concat and bias
-            #
+        #
+        # Step 4: Residual/skip connections, concat and bias
+        #
 
-            out_nodes_features = self.skip_concat_bias(
-                attentions_per_edge, in_nodes_features, out_nodes_features
-            )
-            output_feature_concat.append(out_nodes_features)
-
-        out_nodes_features = torch.stack(output_feature_concat, dim=-1)
-        out_nodes_features = self.layer_combiner(out_nodes_features).squeeze(-1)
-        return (out_nodes_features, edge_index_bank)
+        out_nodes_features = self.skip_concat_bias(
+            attentions_per_edge, in_nodes_features, out_nodes_features
+        )
+        
+        return out_nodes_features
 
     #
     # Helper functions (without comments there is very little code so don't be scared!)

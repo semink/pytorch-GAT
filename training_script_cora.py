@@ -74,7 +74,7 @@ def get_main_loop(
         # Do a forwards pass and extract only the relevant node scores (train/val or test ones)
         # Note: [0] just extracts the node_features part of the data (index 1 contains the edge_index)
         # shape = (N, C) where N is the number of nodes in the split (train/val/test) and C is the number of classes
-        nodes_unnormalized_scores = gat(graph_data)[0].index_select(
+        nodes_unnormalized_scores = gat(graph_data).index_select(
             node_dim, node_indices
         )
 
@@ -199,16 +199,45 @@ def train_gat_cora(config):
             },
         },
         {
-            "pooling": {
-                "edge_index": pyg_utils.dense_to_sparse(
-                    (((adj @ adj @ adj) > 0) ^ ((adj @ adj) > 0)).int()
-                )[0].to(edge_index.device)
-            },
+            "pooling": {"edge_index": edge_index},
             "aggregation": {
-                "edge_index": edge_index,
-                "edge_weight": pyg_utils.dense_to_sparse((adj.T / adj.sum(-1)).T)[1],
+                "edge_index": torch.tensor(
+                    [
+                        list(range(node_features.size(0))),
+                        list(range(node_features.size(0))),
+                    ]
+                ).to(edge_index.device),
+                "edge_weight": torch.tensor([1.0] * node_features.size(0)).to(
+                    edge_index.device
+                ),
             },
-        },
+        }
+        # {
+        #     "pooling": {
+        #         "edge_index": pyg_utils.dense_to_sparse(
+        #             (((adj @ adj @ adj) > 0) ^ ((adj @ adj) > 0) ).int() + torch.eye(adj.size(0)).to(edge_index.device)
+        #         )[0].to(edge_index.device)
+        #     },
+        #     "aggregation": {k:v for k, v in zip(['edge_index', 'edge_weight'], pyg_utils.dense_to_sparse((adj.T / adj.sum(-1)).T))} 
+        # },
+        # {
+        #     "pooling": {
+        #         "edge_index": pyg_utils.dense_to_sparse(
+        #             (((adj) > 0)).int()
+        #         )[0].to(edge_index.device)
+        #     },
+        #     "aggregation": {
+        #         "edge_index": torch.tensor(
+        #             [
+        #                 list(range(node_features.size(0))),
+        #                 list(range(node_features.size(0))),
+        #             ]
+        #         ).to(edge_index.device),
+        #         "edge_weight": torch.tensor([1.0] * node_features.size(0)).to(
+        #             edge_index.device
+        #         ),
+        #     },
+        # },
     ]
 
     # Step 2: prepare the model
@@ -223,6 +252,8 @@ def train_gat_cora(config):
         layer_type=config["layer_type"],
         log_attention_weights=False,  # no need to store attentions, used only in playground.py for visualizations
     ).to(device)
+    
+    print(f"Total number of learnable parameters: {sum(p.numel() for p in gat.parameters() if p.requires_grad)}")
 
     # Step 3: Prepare other training related utilities (loss & optimizer and decorator function)
     loss_fn = nn.CrossEntropyLoss(reduction="mean")
@@ -350,9 +381,18 @@ def get_training_args():
         "num_features_per_layer": [CORA_NUM_INPUT_FEATURES, 8, CORA_NUM_CLASSES],
         "add_skip_connection": False,  # hurts perf on Cora
         "bias": True,  # result is not so sensitive to bias
-        "dropout": 0.6,  # result is sensitive to dropout
+        "dropout": 0.2,  # result is sensitive to dropout
         "layer_type": LayerType.IMP3,  # fastest implementation enabled by default
     }
+    # gat_config = {
+    #     "num_of_layers": 2,  # GNNs, contrary to CNNs, are often shallow (it ultimately depends on the graph properties)
+    #     "num_heads_per_layer": [8, 1],
+    #     "num_features_per_layer": [CORA_NUM_INPUT_FEATURES, 8, CORA_NUM_CLASSES],
+    #     "add_skip_connection": False,  # hurts perf on Cora
+    #     "bias": True,  # result is not so sensitive to bias
+    #     "dropout": 0.6,  # result is sensitive to dropout
+    #     "layer_type": LayerType.IMP3,  # fastest implementation enabled by default
+    # }
 
     # Wrapping training configuration into a dictionary
     training_config = dict()
